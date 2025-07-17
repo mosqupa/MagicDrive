@@ -62,6 +62,9 @@ def load_model_from(
 
 def run_pipe(cfg, pipe, data, seed=None, prompt="", neg_prompt=None, step=None,
              scale=None):
+    if step is not None:
+        step = int(step)
+        
     assert cfg.model.bbox_mode == "all-xyz"
     assert cfg.model.bbox_view_shared == False
     collate_fn_param = {
