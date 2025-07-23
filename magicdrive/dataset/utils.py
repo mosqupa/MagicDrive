@@ -241,11 +241,33 @@ def _preprocess_bbox(bbox_mode, canvas_size, examples, is_train=True,
             ret_classes[_b, _n, :this_box_num] = _classes[_n]
             ret_masks[_b, _n, :this_box_num] = True
 
+
+    """
+    bboxes: Tensor of shape [B, N_cam, max_len, 8, 3]
+        表示每个样本、每个相机视角下最多 max_len 个 3D bounding box。
+        每个 box 有 8 个角点（通过 LiDARInstance3DBoxes.corners 获取），
+        每个角点是一个三维坐标 (x, y, z)。
+        各维度含义如下：
+            B        - batch size
+            N_cam    - 相机数量（通常为 6 个视角）
+            max_len  - 当前 batch 中最多的 box 数，其它样本会补零（padding）
+            8        - 每个 box 的 8 个角点
+            3        - 每个角点的 (x, y, z) 坐标
+
+    classes: LongTensor of shape [B, N_cam, max_len]
+        表示每个 box 对应的类别标签（整数，如 0=car, 1=truck ...）。
+        未填充的位置为 -1。
+
+    masks: BoolTensor of shape [B, N_cam, max_len]
+        表示哪些 box 是有效的（True），哪些是 padding（False），
+        可用于后续 mask 操作，排除无效 box。
+    """
+
     # assemble as input format
     ret_dict = {
-        "bboxes": ret_bboxes,
-        "classes": ret_classes,
-        "masks": ret_masks
+        "bboxes": ret_bboxes, # Tensor[B, N_out, max_len, 8, 3],  # 3D box corners坐标
+        "classes": ret_classes, # Tensor[B, N_out, max_len],  # 3D box类别
+        "masks": ret_masks # Tensor[B, N_out, max_len],  # 3D box mask, 是否是有效 box
     }
     return ret_dict, bboxes_coord
 
@@ -262,6 +284,22 @@ def collate_fn(
     bbox_add_num: int = 3,
 ):
     """
+    examples = [sample_0, sample_1, ..., sample_B-1] is a batch list of data
+    each one is the dict processed by dataset_wrapper.FolderSetWrapper
+
+    {
+        'img': DataContainer(torch.FloatTensor, shape=(6, 3, 224, 400)),
+        'gt_bboxes_3d': DataContainer(LiDARInstance3DBoxes, shape=(N, 7)),
+        'gt_labels_3d': DataContainer(LongTensor, shape=(N,)),
+        'gt_masks_bev': torch.FloatTensor, shape=(8, 200, 200),
+        'camera_intrinsics': DataContainer(torch.FloatTensor, shape=(6, 4, 4)),
+        'lidar2camera': DataContainer(torch.FloatTensor, shape=(6, 4, 4)),
+        'camera2lidar': DataContainer(torch.FloatTensor, shape=(6, 4, 4)),
+        'lidar2image': DataContainer(torch.FloatTensor, shape=(6, 4, 4)),
+        'img_aug_matrix': DataContainer(torch.FloatTensor, shape=(6, 4, 4)),
+        'metas': DataContainer(dict, 包含 location/description/token/timeofday)
+    }
+
     We need to handle:
     1. make multi-view images (img) into tensor -> [N, 6, 3, H, W]
     2. make masks (gt_masks_bev, gt_aux_bev) into tensor
@@ -318,7 +356,7 @@ def collate_fn(
     # 1. do we need to filter bboxes for each view? use `view_shared`
     # 2. padding for one batch of data if need (with zero), and output mask.
     # 3. what is the expected output format? dict of kwargs to bbox embedder
-    canvas_size = pixel_values.shape[-2:]
+    canvas_size = pixel_values.shape[-2:] # [B, 6, 3, H, W] -> (H, W)
     if bbox_mode is not None:
         # NOTE: both can be None
         bboxes_3d_input, bbox_view_coord = _preprocess_bbox(
@@ -349,4 +387,47 @@ def collate_fn(
             continue
     ret_dict['meta_data'] = meta_list_dict
 
+    """
+    Returns:
+        dict:
+            {
+                "bev_map_with_aux": Tensor of shape [B, C_bev, 200, 200]
+                    拼接的 BEV 语义图，C_bev = 8 (map) + 7 (aux, if present)
+
+                "camera_param": Tensor of shape [B, 6, 3, 7]
+                    每个相机的投影参数，拼接 camera_intrinsics[:3,:3] 和 camera2lidar[:3, 3]
+
+                "pixel_values": Tensor of shape [B, 6, 3, H, W]
+                    多视角图像拼接结果（图像张量）
+
+                "captions": List[str], 长度 B
+                    每个样本的文本提示（如 “A driving scene image at boston-seaport. ...”）
+
+                "input_ids": Tensor of shape [B, L]
+                    tokenizer 编码后的输入 token 序列（每个样本）
+
+                "uncond_ids": Tensor of shape [1, L]
+                    空 prompt 对应的 token，用于 classifier-free guidance
+
+                "kwargs": dict, 可包含：
+                    {
+                        "bboxes_3d_data": dict with:
+                            - "bboxes": Tensor [B, N_out, max_len, 8, 3]
+                            - "classes": LongTensor [B, N_out, max_len]
+                            - "masks": BoolTensor [B, N_out, max_len]
+                    }
+
+                "meta_data": dict of lists, like:
+                    {
+                        "metas": List[dict],  # 每个样本的 location / description / token 等，用于 prompt 构建
+                        "camera_intrinsics": List[Tensor[6, 4, 4]],
+                        "lidar2camera":      List[Tensor[6, 4, 4]],
+                        "camera2lidar":      List[Tensor[6, 4, 4]],
+                        "lidar2image":       List[Tensor[6, 4, 4]],
+                        "img_aug_matrix":    List[Tensor[6, 4, 4]],
+                        ...
+                        # 其他存在于每个 sample 中的 META_KEY_LIST 字段也会被添加为 list
+                    }
+            }
+    """
     return ret_dict

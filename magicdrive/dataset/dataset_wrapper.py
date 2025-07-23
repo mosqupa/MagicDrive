@@ -54,3 +54,46 @@ class FolderSetWrapper(torch.utils.data.DataLoader):
 
     def __len__(self):
         return len(self.dataset)
+
+"""
+{
+    # 1. 多视角图像
+    'img': DataContainer(torch.FloatTensor, shape=(6, 3, 224, 400)),
+    
+    # 2. 3D边界框（已封装为 LiDAR 坐标系下的结构化类）
+    'gt_bboxes_3d': DataContainer(
+        LiDARInstance3DBoxes,  # box_dim=7, origin=(0.5, 0.5, 0)
+        tensor shape=(N, 7)
+    ),
+    
+    # 3. 3D边界框类别
+    'gt_labels_3d': DataContainer(torch.LongTensor, shape=(N,)),
+
+    # 4. BEV supervision 目标图
+    'gt_masks_bev': torch.FloatTensor, shape=(8, 200, 200),
+
+    # 5. 相机内参
+    'camera_intrinsics': DataContainer(torch.FloatTensor, shape=(6, 4, 4)),
+
+    # 6. LiDAR → Camera 的外参矩阵
+    'lidar2camera': DataContainer(torch.FloatTensor, shape=(6, 4, 4)),
+
+    # 7. Camera → LiDAR 的外参（反推获得）
+    'camera2lidar': DataContainer(torch.FloatTensor, shape=(6, 4, 4)),
+
+    # 8. LiDAR → image（K @ T）
+    'lidar2image': DataContainer(torch.FloatTensor, shape=(6, 4, 4)),
+
+    # 9. 图像数据增强矩阵（如 resize、crop）
+    'img_aug_matrix': DataContainer(torch.FloatTensor, shape=(6, 4, 4)),
+
+    # 10. 元信息（主要用于生成 prompt）
+    'metas': DataContainer(dict)，包含：
+        {
+            'location': str (如 "boston-seaport"),
+            'description': str (如 "dense traffic"),
+            'timeofday': str,
+            'token': str (nuscenes样本token)
+        }
+}
+"""
