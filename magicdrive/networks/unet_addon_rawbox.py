@@ -297,11 +297,12 @@ class BEVControlNetModel(ModelMixin, ConfigMixin):
             f"but your data actually have {emb_num} to embed. Please change your config."
         )
         camera_emb = self.cam_embedder(
-            rearrange(camera_param, "b n d c -> (b n c) d")
-        )
+            rearrange(camera_param, "b n d c -> (b n c) d") # (b, n, d, c) -> (bs*n*c, d)
+        )# eg: [2, 6, 3, 7] -> [84, 3]
+        # [84, 3] through cam_embedder -> [84, 27]
         camera_emb = rearrange(
-            camera_emb, "(b n c) d -> b n (c d)", n=N_cam, b=bs
-        )
+            camera_emb, "(b n c) d -> b n (c d)", n=N_cam, b=bs # (bs*n*c, d) -> (b, n, c*d)
+        )# eg: [84, 27] -> [2, 6, 7*27]
         return camera_emb
 
     def uncond_cam_param(self, repeat_size: Union[List[int], int] = 1):
@@ -331,8 +332,8 @@ class BEVControlNetModel(ModelMixin, ConfigMixin):
         encoder_hidden_states_with_cam = torch.cat([
             cam_hidden_states.unsqueeze(2),  # B, N_cam, 1, 768
             repeat(encoder_hidden_states, 'b c ... -> b repeat c ...',
-                   repeat=N_cam)
-        ], dim=2)  # B, N, len + 1, dim
+                   repeat=N_cam) # B, N_cam, len, 768
+        ], dim=2)  # B, N_cam, len + 1, dim
         return encoder_hidden_states_with_cam
 
     def substitute_with_uncond_cam(
@@ -741,8 +742,9 @@ class BEVControlNetModel(ModelMixin, ConfigMixin):
             attention_mask = attention_mask.unsqueeze(1)
 
         # 0. camera
-        N_cam = camera_param.shape[1]
-        camera_emb = self._embed_camera(camera_param)
+        N_cam = camera_param.shape[1] # (bs, N_cam, 3, 7) -> N_cam
+        camera_emb = self._embed_camera(camera_param) # (bs, N_cam, 7*27)
+
         # (B, N_cam, max_len + 1, dim=768)
         encoder_hidden_states_with_cam = self.add_cam_states(
             encoder_hidden_states, camera_emb
@@ -834,20 +836,20 @@ class BEVControlNetModel(ModelMixin, ConfigMixin):
             emb = emb + class_emb
 
         # BEV: we remap data to have (B n) as batch size
-        sample = rearrange(sample, 'b n ... -> (b n) ...')
+        sample = rearrange(sample, 'b n ... -> (b n) ...') # (2*bs, N_cam, 4, 28, 50) -> (2*bs*N_cam, 4, 28, 50)
         encoder_hidden_states_with_cam = rearrange(
             encoder_hidden_states_with_cam, 'b n ... -> (b n) ...')
         if len(emb) < len(sample):
             emb = repeat(emb, 'b ... -> (b repeat) ...', repeat=N_cam)
-        controlnet_cond = repeat(
+        controlnet_cond = repeat( # (2*bs, c, 200, 200) -> (2*bs*N_cam, c, 200, 200)
             controlnet_cond, 'b ... -> (b repeat) ...', repeat=N_cam)
 
         # 2. pre-process
-        sample = self.conv_in(sample)
+        sample = self.conv_in(sample) # (2*bs*N_cam, 4, 28, 50) -> (2*bs*N_cam, 320, 28, 50)
 
-        controlnet_cond = self.controlnet_cond_embedding(controlnet_cond)
+        controlnet_cond = self.controlnet_cond_embedding(controlnet_cond) # (2*bs*N_cam, 320, 28, 50)
 
-        sample += controlnet_cond
+        sample += controlnet_cond # (2*bs*N_cam, 320, 28, 50)
 
         # 3. down
         down_block_res_samples = (sample,)

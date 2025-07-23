@@ -270,7 +270,7 @@ class StableDiffusionBEVControlNetPipeline(StableDiffusionControlNetPipeline):
         # 3. Encode input prompt
         # NOTE: here they use padding to 77, is this necessary?
         prompt_embeds = self._encode_prompt(
-            prompt,
+            prompt, # List[str] 长度为B，即batch size
             device,
             num_images_per_prompt,
             do_classifier_free_guidance,
@@ -278,6 +278,12 @@ class StableDiffusionBEVControlNetPipeline(StableDiffusionControlNetPipeline):
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
         )  # (2 * b, 77 + 1, 768)
+        # 启用了 classifier-free guidance（do_classifier_free_guidance=True），所以：
+        # 第一部分是 无条件 prompt 的 embedding（如空字符串 ""）
+        # 第二部分是 真实文本 prompt 的 embedding（如 "A driving scene in boston."）
+        # 这两个 embedding 将拼接在一起，并一起送入 UNet 推理过程中，后续用来计算引导形式：
+        # 例如传入三个prompt，启用guidance，会有3个空prompt和3个真prompt
+        # shape: (6, 77 + 1, 768)
 
         # 4. Prepare image
         # NOTE: if image is not tensor, there will be several process.
@@ -318,6 +324,7 @@ class StableDiffusionBEVControlNetPipeline(StableDiffusionControlNetPipeline):
 
         # 7. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+        # extra_step_kwargs = {"eta": 0.0}
 
         ###### BEV: here we reconstruct each input format ######
         assert camera_param.shape[0] == batch_size, \
@@ -326,7 +333,7 @@ class StableDiffusionBEVControlNetPipeline(StableDiffusionControlNetPipeline):
         latents = torch.stack([latents] * N_cam, dim=1)  # bs, 6, 4, 28, 50
         # prompt_embeds, no need for b, len, 768
         # image, no need for b, c, 200, 200
-        camera_param = camera_param.to(self.device)
+        camera_param = camera_param.to(self.device) # (bs, 6, 3, 7)
         if do_classifier_free_guidance and not guess_mode:
             # uncond in the front, cond in the tail
             _images = list(torch.chunk(image, 2))
@@ -357,7 +364,7 @@ class StableDiffusionBEVControlNetPipeline(StableDiffusionControlNetPipeline):
                 )
 
                 # controlnet(s) inference
-                controlnet_t = t.unsqueeze(0)
+                controlnet_t = t.unsqueeze(0) # shape: (1, )
                 # guess_mode & classifier_free_guidance -> only guidance use controlnet
                 # not guess_mode & classifier_free_guidance -> all use controlnet
                 # guess_mode -> normal input, take effect in controlnet
@@ -373,17 +380,24 @@ class StableDiffusionBEVControlNetPipeline(StableDiffusionControlNetPipeline):
                 # fmt: off
                 down_block_res_samples, mid_block_res_sample, \
                 encoder_hidden_states_with_cam = self.controlnet(
-                    controlnet_latent_model_input,
-                    controlnet_t,
-                    camera_param,  # for BEV
-                    encoder_hidden_states=controlnet_prompt_embeds,
-                    controlnet_cond=image,
+                    controlnet_latent_model_input, # (bs*2, 6, 4, 28, 50)
+                    controlnet_t, # (bs*2, 1)
+                    camera_param,  # for BEV shape: (bs, 6, 3, 7)
+                    encoder_hidden_states=controlnet_prompt_embeds, # (2 * bs, 77 + 1, 768)
+                    controlnet_cond=image, # (2 * bs, c_26, 200, 200)
                     conditioning_scale=controlnet_conditioning_scale,
                     guess_mode=guess_mode,
                     return_dict=False,
                     **bev_controlnet_kwargs, # for BEV
+                    # 解包传入
+                    # bboxes_3d_data={     # 👈 这是解包后的效果
+                    #     "bboxes": ...,
+                    #     "classes": ...,
+                    #     "masks": ...
+                    # }
                 )
                 # fmt: on
+                # encoder_hidden_states_with_cam: (2b x N_cam, 79, 768)
 
                 if guess_mode and do_classifier_free_guidance:
                     # Infered ControlNet only for the conditional batch.
@@ -413,9 +427,9 @@ class StableDiffusionBEVControlNetPipeline(StableDiffusionControlNetPipeline):
                 # predict the noise residual: 2bxN, 4, 28, 50
                 additional_param = {}
                 noise_pred = self.unet(
-                    latent_model_input,  # may with unconditional
-                    t,
-                    encoder_hidden_states=encoder_hidden_states_with_cam,
+                    latent_model_input,  # may with unconditional 2b x N_cam, 4, 28, 50
+                    t, # torch.tensor
+                    encoder_hidden_states=encoder_hidden_states_with_cam, # (2b x N_cam, 79, 768)
                     **additional_param,  # if use original unet, it cannot take kwargs
                     cross_attention_kwargs=cross_attention_kwargs,
                     down_block_additional_residuals=down_block_res_samples,

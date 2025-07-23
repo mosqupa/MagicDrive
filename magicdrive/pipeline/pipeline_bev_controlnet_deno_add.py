@@ -1,13 +1,16 @@
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import inspect
-import os
 
 import torch
 import PIL
 import numpy as np
 from einops import rearrange
+from torchvision import transforms
 
+from hydra.utils import to_absolute_path
+from diffusers import StableDiffusionControlNetPipeline
+from diffusers.utils import BaseOutput
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL, UNet2DConditionModel
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
@@ -15,14 +18,27 @@ from diffusers.schedulers.scheduling_utils import KarrasDiffusionSchedulers
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 
 from ..misc.common import move_to
-from .pipeline_bev_controlnet import (
-    StableDiffusionBEVControlNetPipeline,
-    BEVStableDiffusionPipelineOutput,
-)
-from ..networks.virtual_image_encoder import VirtualImageEncoder # new imported
+from ..networks.resnet import ResNet34Half
 
-class StableDiffusionBEVControlNetVirtualImagePipeline(
-        StableDiffusionBEVControlNetPipeline):
+@dataclass
+class BEVStableDiffusionPipelineOutput(BaseOutput):
+    """
+    Output class for Stable Diffusion pipelines.
+
+    Args:
+        images (`List[PIL.Image.Image]` or `np.ndarray`)
+            List of denoised PIL images of length `batch_size` or numpy array of shape `(batch_size, height, width,
+            num_channels)`. PIL images or numpy array present the denoised images of the diffusion pipeline.
+        nsfw_content_detected (`List[bool]`)
+            List of flags denoting whether the corresponding generated image likely represents "not-safe-for-work"
+            (nsfw) content, or `None` if safety checking could not be performed.
+    """
+
+    images: Union[List[List[PIL.Image.Image]], np.ndarray]
+    nsfw_content_detected: Optional[List[bool]]
+
+
+class StableDiffusionBEVControlNetDenoAddPipeline(StableDiffusionControlNetPipeline):
     def __init__(
         self,
         vae: AutoencoderKL,
@@ -53,28 +69,60 @@ class StableDiffusionBEVControlNetVirtualImagePipeline(
             do_convert_rgb=False,
             do_normalize=False,
         )
+        self.resnet = ResNet34Half().to('cuda')
+        self.virtual_image_transform = transforms.Compose([
+            transforms.Resize((224, 224)),  # 或其他一致分辨率
+            transforms.ToTensor(),
+        ])
 
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: Union[str, os.PathLike], **kwargs):
-        tokenizer = kwargs.pop("tokenizer", None)
-        tokenizer_path = kwargs.pop("tokenizer_name_or_path", os.path.join(pretrained_model_name_or_path, "tokenizer"))
+    def numpy_to_pil_double(self, images):
+        """
+        Convert a numpy image or a batch of images to a PIL image.
+        We need to handle 5-dim inputs and reture 2-dim list.
+        """
+        imgs_list = []
+        for imgs in images:
+            imgs_list.append(self.numpy_to_pil(imgs))
+        return imgs_list
 
-        pipe = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
+    def prepare_extra_step_kwargs(self, generator, eta):
+        # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
+        # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
+        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+        # and should be between [0, 1]
 
-        if tokenizer is not None:
-            pipe.tokenizer = tokenizer
-        else:
-            pipe.tokenizer = CLIPTokenizer.from_pretrained(tokenizer_path)
+        accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
+        extra_step_kwargs = {}
+        if accepts_eta:
+            extra_step_kwargs["eta"] = eta
 
-        return pipe
+        # check if the scheduler accepts generator
+        accepts_generator = "generator" in set(inspect.signature(self.scheduler.step).parameters.keys())
+        if accepts_generator:
+            raise RuntimeError("If you fixed the logic for generator, please remove this. Otherwise, please use other sampler.")
+            extra_step_kwargs["generator"] = generator
+        return extra_step_kwargs
 
+    def decode_latents(self, latents):
+        # decode latents with 5-dims
+        latents = 1 / self.vae.config.scaling_factor * latents
+
+        bs = len(latents)
+        latents = rearrange(latents, 'b c ... -> (b c) ...')
+        image = self.vae.decode(latents).sample
+        image = rearrange(image, '(b c) ... -> b c ...', b=bs)
+
+        image = (image / 2 + 0.5).clamp(0, 1)
+        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
+        image = rearrange(image.cpu(), '... c h w -> ... h w c').float().numpy()
+        return image
 
     @torch.no_grad()
     def __call__(
         self,
         prompt: Union[str, List[str]],
         image: torch.FloatTensor,
-        virtual_image: Union[torch.FloatTensor, PIL.Image.Image], # new_add
         camera_param: Union[torch.Tensor, None],
         height: int,
         width: int,
@@ -229,7 +277,7 @@ class StableDiffusionBEVControlNetVirtualImagePipeline(
         # 3. Encode input prompt
         # NOTE: here they use padding to 77, is this necessary?
         prompt_embeds = self._encode_prompt(
-            prompt,
+            prompt, # List[str] 长度为B，即batch size
             device,
             num_images_per_prompt,
             do_classifier_free_guidance,
@@ -237,6 +285,12 @@ class StableDiffusionBEVControlNetVirtualImagePipeline(
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
         )  # (2 * b, 77 + 1, 768)
+        # 启用了 classifier-free guidance（do_classifier_free_guidance=True），所以：
+        # 第一部分是 无条件 prompt 的 embedding（如空字符串 ""）
+        # 第二部分是 真实文本 prompt 的 embedding（如 "A driving scene in boston."）
+        # 这两个 embedding 将拼接在一起，并一起送入 UNet 推理过程中，后续用来计算引导形式：
+        # 例如传入三个prompt，启用guidance，会有3个空prompt和3个真prompt
+        # shape: (6, 77 + 1, 768)
 
         # 4. Prepare image
         # NOTE: if image is not tensor, there will be several process.
@@ -259,7 +313,6 @@ class StableDiffusionBEVControlNetVirtualImagePipeline(
             image = torch.cat(_images)
 
         # 5. Prepare timesteps
-        num_inference_steps = int(num_inference_steps)  # ← 添加这一行，强制转换为 int
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
@@ -278,6 +331,7 @@ class StableDiffusionBEVControlNetVirtualImagePipeline(
 
         # 7. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+        # extra_step_kwargs = {"eta": 0.0}
 
         ###### BEV: here we reconstruct each input format ######
         assert camera_param.shape[0] == batch_size, \
@@ -286,7 +340,7 @@ class StableDiffusionBEVControlNetVirtualImagePipeline(
         latents = torch.stack([latents] * N_cam, dim=1)  # bs, 6, 4, 28, 50
         # prompt_embeds, no need for b, len, 768
         # image, no need for b, c, 200, 200
-        camera_param = camera_param.to(self.device)
+        camera_param = camera_param.to(self.device) # (bs, 6, 3, 7)
         if do_classifier_free_guidance and not guess_mode:
             # uncond in the front, cond in the tail
             _images = list(torch.chunk(image, 2))
@@ -299,19 +353,18 @@ class StableDiffusionBEVControlNetVirtualImagePipeline(
             kwargs_with_uncond.pop("max_len", None)  # some do not take this.
             camera_param = kwargs_with_uncond.pop("camera_param")
             _images[0] = kwargs_with_uncond.pop("image")
-
-            # ✅ 👇 加在这里
-            kwargs_with_uncond["virtual_image_embedding"] = virtual_image_embedding
-
             image = torch.cat(_images)
             bev_controlnet_kwargs = move_to(kwargs_with_uncond, self.device)
         ###### BEV end ######
 
-        ##################### virtual image embedding ##########################
-        # 7.5 virtual image embedding
-        virtual_image_embedding = self.virtual_image_encoder(virtual_image)
-        ########################################################################
-
+        # 7.5 Prepare virtual image
+        virtual_image_path = to_absolute_path("virtual_images/image.png")
+        virtual_image = PIL.Image.open(virtual_image_path).convert("RGB")
+        virtual_tensor = self.virtual_image_transform(virtual_image).unsqueeze(0).to(self.device)  # [1, 3, H, W]
+        latent_virtual_image = self.resnet(virtual_tensor) # [1, 4, 28, 50]
+        latent_virtual_image = latent_virtual_image.unsqueeze(1).repeat(1, N_cam, 1, 1, 1)  # → [1, N, 4, 28, 50]
+        latent_virtual_image = latent_virtual_image.repeat(batch_size, 1, 1, 1, 1)  # → [bs, N, 4, 28, 50]
+        latent_virtual_image = latent_virtual_image.to(dtype=self.controlnet.dtype)
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -321,12 +374,20 @@ class StableDiffusionBEVControlNetVirtualImagePipeline(
                 latent_model_input = (
                     torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 )
+
+                # add virtual image to the latents
+                virtual_image_input = (
+                    torch.cat([latent_virtual_image] * 2) if do_classifier_free_guidance else latent_virtual_image
+                )
+                latent_model_input = latent_model_input + virtual_image_input * 10
+                print("Denoising step:", i)
+
                 latent_model_input = self.scheduler.scale_model_input(
                     latent_model_input, t
                 )
 
                 # controlnet(s) inference
-                controlnet_t = t.unsqueeze(0)
+                controlnet_t = t.unsqueeze(0) # shape: (1, )
                 # guess_mode & classifier_free_guidance -> only guidance use controlnet
                 # not guess_mode & classifier_free_guidance -> all use controlnet
                 # guess_mode -> normal input, take effect in controlnet
@@ -342,18 +403,24 @@ class StableDiffusionBEVControlNetVirtualImagePipeline(
                 # fmt: off
                 down_block_res_samples, mid_block_res_sample, \
                 encoder_hidden_states_with_cam = self.controlnet(
-                    controlnet_latent_model_input,
-                    controlnet_t,
-                    camera_param,  # for BEV
-                    encoder_hidden_states=controlnet_prompt_embeds,
-                    virtual_image_embedding=virtual_image_embedding, # new added for virtual image
-                    controlnet_cond=image,
+                    controlnet_latent_model_input, # (bs*2, 6, 4, 28, 50)
+                    controlnet_t, # (bs*2, 1)
+                    camera_param,  # for BEV shape: (bs, 6, 3, 7)
+                    encoder_hidden_states=controlnet_prompt_embeds, # (2 * bs, 77 + 1, 768)
+                    controlnet_cond=image, # (2 * bs, c_26, 200, 200)
                     conditioning_scale=controlnet_conditioning_scale,
                     guess_mode=guess_mode,
                     return_dict=False,
                     **bev_controlnet_kwargs, # for BEV
+                    # 解包传入
+                    # bboxes_3d_data={     # 👈 这是解包后的效果
+                    #     "bboxes": ...,
+                    #     "classes": ...,
+                    #     "masks": ...
+                    # }
                 )
                 # fmt: on
+                # encoder_hidden_states_with_cam: (2b x N_cam, 79, 768)
 
                 if guess_mode and do_classifier_free_guidance:
                     # Infered ControlNet only for the conditional batch.
@@ -383,7 +450,7 @@ class StableDiffusionBEVControlNetVirtualImagePipeline(
                 # predict the noise residual: 2bxN, 4, 28, 50
                 additional_param = {}
                 noise_pred = self.unet(
-                    latent_model_input,  # may with unconditional
+                    latent_model_input,  # may with unconditional 2b x N, 4, 28, 50
                     t,
                     encoder_hidden_states=encoder_hidden_states_with_cam,
                     **additional_param,  # if use original unet, it cannot take kwargs

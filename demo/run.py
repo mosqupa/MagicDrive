@@ -31,7 +31,7 @@ def output_func(x): return concat_6_views(x)
 
 
 @hydra.main(version_base=None, config_path="../configs",
-            config_name="test_config")
+            config_name="test_config_new")
 def main(cfg: DictConfig):
     if cfg.debug:
         import debugpy

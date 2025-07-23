@@ -187,6 +187,18 @@ We prepare the nuScenes dataset similar to [bevfusion's instructions](https://gi
 
 ### Train the model
 
+Launch training with (with 4070):
+
+```bash
+accelerate launch --mixed_precision fp16 demo/train.py   +exp=224x400_new runner=debug
+(no validation)
+```
+
+```
+accelerate launch --mixed_precision fp16 tools/train.py \
+  +exp=224x400 runner=debug runner.validation_before_run=true
+```
+
 Launch training with (with 8xV100):
 ```bash
 accelerate launch --mixed_precision fp16 --gpu_ids all --num_processes 8 tools/train.py \

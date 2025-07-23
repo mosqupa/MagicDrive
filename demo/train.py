@@ -39,7 +39,7 @@ def set_logger(global_rank, logdir):
     root.addHandler(handler)
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="config")
+@hydra.main(version_base=None, config_path="../configs", config_name="config_new")
 def main(cfg: DictConfig):
     if cfg.debug:
         import debugpy
@@ -48,6 +48,7 @@ def main(cfg: DictConfig):
         debugpy.wait_for_client()
         print('Attached, continue...')
 
+    print(f">>>> Loaded config: {cfg.model.unet_module}")
     # setup logger
     # only log debug info to log file
     logging.getLogger().setLevel(logging.DEBUG)
@@ -86,10 +87,11 @@ def main(cfg: DictConfig):
         OmegaConf.to_container(cfg.dataset.data.val, resolve=True)
     )
 
+    print(f">>>> Loaded config: {cfg.model.unet_module}")
     # runner
     if cfg.resume_from_checkpoint and cfg.resume_from_checkpoint.endswith("/"):
         cfg.resume_from_checkpoint = cfg.resume_from_checkpoint[:-1]
-    runner_cls = load_module(cfg.model.runner_module) # magicdrive.runner.multiview_runner.MultiviewRunner
+    runner_cls = load_module(cfg.model.runner_module) # magicdrive.runner.multiview_runner_new.MultiviewRunnerNew
     runner = runner_cls(cfg, accelerator, train_dataset, val_dataset)
     runner.set_optimizer_scheduler()
     runner.prepare_device()
