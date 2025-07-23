@@ -240,14 +240,28 @@ def run_one_batch_pipe(
     gen_imgs_list = [[] for _ in range(batch_size)]
     for ti in range(cfg.runner.validation_times):
         image: BEVStableDiffusionPipelineOutput = pipe(
-            prompt=captions,
-            image=bev_map_with_aux,
-            camera_param=camera_param,
-            height=cfg.dataset.image_size[0],
-            width=cfg.dataset.image_size[1],
+            prompt=captions, # # List[str], 长度 B 每个样本的文本提示 （如 “A driving scene image at boston-seaport. ...”）
+            image=bev_map_with_aux, # Tensor of shape [B, C_bev, 200, 200]
+            camera_param=camera_param, #  Tensor of shape [B, 6, 3, 7]
+            height=cfg.dataset.image_size[0], # 224
+            width=cfg.dataset.image_size[1], # 400
             generator=generator,
             bev_controlnet_kwargs=bev_controlnet_kwargs,
+            # dict {
+            #          "bboxes_3d_data": dict with:
+            #              - "bboxes": Tensor [B, N_out, max_len, 8, 3]
+            #              - "classes": LongTensor [B, N_out, max_len]
+            #              - "masks": BoolTensor [B, N_out, max_len]
+            #      }
             **cfg.runner.pipeline_param,
+            # pipeline_param:
+            #  guidance_scale: 2
+            #  num_inference_steps: 20
+            #  eta: 0.0
+            #  controlnet_conditioning_scale: 1.0
+            #  guess_mode: false
+            #  use_zero_map_as_unconditional: false
+            #  bbox_max_length: null
         )
         image: List[List[Image.Image]] = image.images
         for bi, imgs in enumerate(image):
@@ -301,9 +315,20 @@ def run_one_batch(cfg, pipe, val_input, weight_dtype, global_generator=None,
 
     # 3-dim list: B, Times, views
     gen_imgs_list = run_one_batch_pipe_func(
-        cfg, pipe, val_input['pixel_values'], val_input['captions'],
-        val_input['bev_map_with_aux'], camera_param, val_input['kwargs'],
-        global_generator=global_generator)
+        cfg, 
+        pipe, 
+        val_input['pixel_values'], # Tensor of shape [B, 6, 3, H, W]
+        val_input['captions'], # List[str], 长度 B 每个样本的文本提示（如 “A driving scene image at boston-seaport. ...”）
+        val_input['bev_map_with_aux'], # Tensor of shape [B, C_bev, 200, 200]
+        camera_param, # Tensor of shape [B, 6, 3, 7]
+        val_input['kwargs'], # dict {
+                             #          "bboxes_3d_data": dict with:
+                             #              - "bboxes": Tensor [B, N_out, max_len, 8, 3]
+                             #              - "classes": LongTensor [B, N_out, max_len]
+                             #              - "masks": BoolTensor [B, N_out, max_len]
+                             #      }
+        global_generator=global_generator
+    )
 
     # save gen with box
     gen_imgs_wb_list = []
