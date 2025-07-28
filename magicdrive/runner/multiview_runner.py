@@ -105,29 +105,40 @@ class MultiviewRunner(BaseRunner):
         # fmt: on
 
     def _init_trainable_models(self, cfg):
-        # fmt: off
-        unet = UNet2DConditionModel.from_pretrained(cfg.model.pretrained_model_name_or_path, subfolder="unet")
-        # fmt: on
-
-        model_cls = load_module(cfg.model.unet_module)
+        # 判断使用哪个unet权重路径
+        if cfg.resume_from_checkpoint:
+            unet_dir = os.path.join(cfg.resume_from_checkpoint, cfg.model.unet_dir)
+        else:
+            unet_dir = os.path.join(cfg.model.pretrained_model_name_or_path, "unet")
+        print(cfg.resume_from_checkpoint)
+        print(unet_dir)
+        # 加载基础unet权重
+        print("Resuming from the pretrained unet:", unet_dir)
+        unet = UNet2DConditionModel.from_pretrained(unet_dir)
+        print(cfg.model.unet_module)
+        # 初始化自定义UNet类
+        model_cls = load_module(cfg.model.unet_module) # magicdrive.networks.unet_2d_condition_multiview.UNet2DConditionModelMultiview
         unet_param = OmegaConf.to_container(self.cfg.model.unet, resolve=True)
         self.unet = model_cls.from_unet_2d_condition(unet, **unet_param)
 
-        model_cls = load_module(cfg.model.model_module)
-        controlnet_param = OmegaConf.to_container(
-            self.cfg.model.controlnet, resolve=True)
+        # 初始化自定义ControlNet类
+        model_cls = load_module(cfg.model.model_module) # magicdrive.networks.unet_addon_rawbox.BEVControlNetModel
+        controlnet_param = OmegaConf.to_container(cfg.model.controlnet, resolve=True)
         self.controlnet = model_cls.from_unet(unet, **controlnet_param)
 
     def _set_model_trainable_state(self, train=True):
         # set trainable status
         self.vae.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
-        self.controlnet.train(train)
+        self.controlnet.requires_grad_(False)  # ✅ 冻住ControlNet
         self.unet.requires_grad_(False)
         for name, mod in self.unet.trainable_module.items():
-            logging.debug(
-                f"[MultiviewRunner] set {name} to requires_grad = True")
-            mod.requires_grad_(train)
+            if name.startswith("up_blocks"):
+                logging.debug(f"[MultiviewRunner] set {name} to requires_grad = True")
+                mod.requires_grad_(train)
+            else:
+                mod.requires_grad_(False)
+        
 
     def set_optimizer_scheduler(self):
         # optimizer and lr_schedulers

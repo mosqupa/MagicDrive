@@ -16,11 +16,14 @@ from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 import logging
 import copy
+import PIL
+from torchvision import transforms
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
+import os
 
 from diffusers.configuration_utils import register_to_config
 from diffusers.models.unet_2d_condition import (
@@ -39,6 +42,7 @@ from ..misc.common import _get_module, _set_module
 from .blocks import (
     BasicMultiviewTransformerBlock,
 )
+from .resnet import ResNet34Half, HiddenImageConv, HiddenImageConvPost
 
 
 class UNet2DConditionModelMultiview(UNet2DConditionModel):
@@ -234,6 +238,27 @@ class UNet2DConditionModelMultiview(UNet2DConditionModel):
                     self._new_module[f"{name}.{k}"] = v
         self.trainable_state = trainable_state
 
+        ############################################## for virtual image encoder #############################################
+        self.use_virtual_image_encoder = False
+        self.N_cam = 6
+        CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))   # 当前 .py 文件所在路径
+        PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))  # magicdrive/
+        self.image_path = os.path.join(PROJECT_ROOT, "virtual_images", "image.png")
+        if self.use_virtual_image_encoder:
+            self.resnet = ResNet34Half().to(self.device, dtype=torch.float16)
+            self.hidden_image_conv = HiddenImageConv().to(self.device, dtype=torch.float16)
+            self.hidden_image_conv_post = HiddenImageConvPost().to(self.device, dtype=torch.float16)
+            self.virtual_image_transform = transforms.Compose([
+                transforms.Resize((224, 224)),  # 或其他一致分辨率
+                transforms.ToTensor(),
+            ])
+        else:
+            self.resnet = None  # 不注册
+            self.hidden_image_conv = None
+            self.hidden_image_conv_post = None
+            self.virtual_image_transform = None
+        ######################################################################################################################
+
     @property
     def trainable_module(self) -> Dict[str, nn.Module]:
         if self.trainable_state == "all":
@@ -296,6 +321,7 @@ class UNet2DConditionModelMultiview(UNet2DConditionModel):
         cls,
         unet: UNet2DConditionModel,
         load_weights_from_unet: bool = True,
+        use_virtual_image_encoder: bool = False,
         # multivew
         **kwargs,
     ):
@@ -307,12 +333,9 @@ class UNet2DConditionModelMultiview(UNet2DConditionModel):
                 UNet model which weights are copied to the ControlNet. Note that all configuration options are also
                 copied where applicable.
         """
+        config = {**unet.config, **kwargs}
 
-        unet_2d_condition_multiview = cls(
-            **unet.config,
-            # multivew
-            **kwargs,
-        )
+        unet_2d_condition_multiview = cls(**config)
 
         if load_weights_from_unet:
             missing_keys, unexpected_keys = unet_2d_condition_multiview.load_state_dict(
@@ -321,6 +344,17 @@ class UNet2DConditionModelMultiview(UNet2DConditionModel):
                 f"[UNet2DConditionModelMultiview] load pretrained with "
                 f"missing_keys: {missing_keys}; "
                 f"unexpected_keys: {unexpected_keys}")
+
+        if unet_2d_condition_multiview.use_virtual_image_encoder:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            dtype = torch.float16
+            unet_2d_condition_multiview.resnet = ResNet34Half().to(device, dtype=dtype)
+            unet_2d_condition_multiview.hidden_image_conv = HiddenImageConv().to(device, dtype=dtype)
+            unet_2d_condition_multiview.hidden_image_conv_post = HiddenImageConvPost().to(device, dtype=dtype)
+            unet_2d_condition_multiview.virtual_image_transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+            ])
 
         return unet_2d_condition_multiview
 
@@ -439,8 +473,8 @@ class UNet2DConditionModelMultiview(UNet2DConditionModel):
         if self.encoder_hid_proj is not None:
             encoder_hidden_states = self.encoder_hid_proj(encoder_hidden_states)
 
-        # 2. pre-process
-        sample = self.conv_in(sample)
+        # 2. pre-process 处理latent_model_input
+        sample = self.conv_in(sample) # (2b*N_cam, 4, 28, 50) -> (2b*N_cam, 320, 28, 50)
 
         # 3. down
         down_block_res_samples = (sample,)
@@ -486,6 +520,37 @@ class UNet2DConditionModelMultiview(UNet2DConditionModel):
 
         if mid_block_additional_residual is not None:
             sample = sample + mid_block_additional_residual
+        
+        # through down and mid, sample shape: [2*bs*N_cam, 1280, 4, 6]
+        #################################### virtual image encoder #########################################
+
+        B_mul_N = sample.shape[0] // 2
+        image = PIL.Image.open(self.image_path).convert("RGB")
+        if not self.use_virtual_image_encoder:
+            resnet = ResNet34Half().to(self.device, dtype=sample.dtype)
+            hidden_image_conv = HiddenImageConv().to(self.device, dtype=sample.dtype)
+            hidden_image_conv_post = HiddenImageConvPost().to(self.device, dtype=sample.dtype)
+            virtual_image_transform = transforms.Compose([
+                transforms.Resize((224, 224)),  # 或其他一致分辨率
+                transforms.ToTensor(),
+            ])
+        else:
+            resnet = self.resnet
+            hidden_image_conv = self.hidden_image_conv
+            hidden_image_conv_post = self.hidden_image_conv_post
+            virtual_image_transform = self.virtual_image_transform  # ✅
+
+        image_tensor = virtual_image_transform(image).unsqueeze(0).to(self.device, dtype=sample.dtype)  # Add batch dimension
+        encoder_img_hidden_states = resnet(image_tensor)  # [1, 4, 28, 50]
+        encoder_img_hidden_states = encoder_img_hidden_states.expand(B_mul_N, -1, -1, -1)  # [B*N, 4, 28, 50]
+        encoder_img_hidden_states = encoder_img_hidden_states.repeat_interleave(2, dim=0)  # [2*B*N, 4, 28, 50]
+
+        # print(f"[DEBUG] sample shape: {sample.shape}, virtual image shape: {encoder_img_hidden_states.shape}")
+
+        # sample = sample + encoder_img_hidden_states [2*bs*N_cam, 1280, 4, 6]
+        sample = sample + hidden_image_conv(encoder_img_hidden_states).to(dtype=sample.dtype) # [2*bs*N_cam, 1280, 4, 6]
+
+        ####################################################################################################
 
         # 5. up
         for i, upsample_block in enumerate(self.up_blocks):
@@ -514,6 +579,10 @@ class UNet2DConditionModelMultiview(UNet2DConditionModel):
                     hidden_states=sample, temb=emb,
                     res_hidden_states_tuple=res_samples,
                     upsample_size=upsample_size)
+
+        # through up: [2*bs*N_cam, 320, 28, 50]
+        # sample = sample + conv(encoder_img_hidden_states)
+        sample = sample + hidden_image_conv_post(encoder_img_hidden_states).to(dtype=sample.dtype)  # [2*bs*N_cam, 320, 28, 50]
 
         # 6. post-process
         if self.conv_norm_out:

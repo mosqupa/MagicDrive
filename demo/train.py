@@ -39,7 +39,7 @@ def set_logger(global_rank, logdir):
     root.addHandler(handler)
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="config_new")
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
     if cfg.debug:
         import debugpy

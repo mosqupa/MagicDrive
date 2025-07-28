@@ -1,5 +1,5 @@
 name: SDv1.5mv-rawbox
-pretrained_model_name_or_path: pretrained/stable-diffusion-v1-5/
+pretrained_model_name_or_path: pretrained/SDv1.5mv-rawbox_2023-09-07_18-39_224x400/
 bbox_mode: 'all-xyz'
 bbox_view_shared: false
 crossview_attn_type: basic

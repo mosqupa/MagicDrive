@@ -142,6 +142,9 @@ def prepare_all(cfg, device='cuda', need_loader=True):
     assert cfg.resume_from_checkpoint is not None, "Please set model to load"
     setup_logger_seed(cfg)
 
+    print(cfg.model.runner_module)
+    print(cfg.model.unet_module)
+
     #### model ####
     pipe, weight_dtype = build_pipe(cfg, device)
     update_progress_bar_config(pipe, leave=False)

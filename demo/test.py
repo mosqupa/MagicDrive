@@ -23,7 +23,7 @@ from magicdrive.misc.test_utils import (
     prepare_all, run_one_batch
 )
 from magicdrive.misc.common import load_module
-from magicdrive.networks.unet_2d_condition_multiview_new import UNet2DConditionModelMultiview
+from magicdrive.unet_2d_condition_multiview_new import UNet2DConditionModelMultiview
 from magicdrive.networks.resnet import ResNet34Half, HiddenImageConv, HiddenImageConvPost
 
 transparent_bg = True
@@ -37,7 +37,7 @@ def output_func(x): return concat_6_views(x)
 
 
 @hydra.main(version_base=None, config_path="../configs",
-            config_name="test_config_new")
+            config_name="test_config")
 def main(cfg: DictConfig):
     if cfg.debug:
         import debugpy
