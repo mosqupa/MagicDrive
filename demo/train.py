@@ -91,7 +91,7 @@ def main(cfg: DictConfig):
     # runner
     if cfg.resume_from_checkpoint and cfg.resume_from_checkpoint.endswith("/"):
         cfg.resume_from_checkpoint = cfg.resume_from_checkpoint[:-1]
-    runner_cls = load_module(cfg.model.runner_module) # magicdrive.runner.multiview_runner_new.MultiviewRunnerNew
+    runner_cls = load_module(cfg.model.runner_module) # magicdrive.runner.multiview_runner.MultiviewRunner
     runner = runner_cls(cfg, accelerator, train_dataset, val_dataset)
     runner.set_optimizer_scheduler()
     runner.prepare_device()

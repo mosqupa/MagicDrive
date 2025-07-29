@@ -190,7 +190,7 @@ We prepare the nuScenes dataset similar to [bevfusion's instructions](https://gi
 Launch training with (with 4070):
 
 ```bash
-accelerate launch --mixed_precision fp16 demo/train.py   +exp=224x400_new runner=debug
+accelerate launch --mixed_precision fp16 demo/train.py   +exp=224x400 runner=debug
 (no validation)
 ```
 

@@ -23,7 +23,6 @@ from magicdrive.misc.test_utils import (
     prepare_all, run_one_batch
 )
 from magicdrive.misc.common import load_module
-from magicdrive.unet_2d_condition_multiview_new import UNet2DConditionModelMultiview
 from magicdrive.networks.resnet import ResNet34Half, HiddenImageConv, HiddenImageConvPost
 
 transparent_bg = True
@@ -112,14 +111,12 @@ def get_unet():
     unet = unet_cls.from_pretrained(
             unet_path, torch_dtype=torch.float16)
 
-def get_unet_addon():
-    unet_addon_path = "magicdrive-log/SDv1.5mv-rawbox_2023-09-07_18-39_224x400/unet_addon"
-    unet_addon_config = "magicdrive.networks.unet_2d_condition_multiview.UNet2DConditionModelMultiview"
-    unet_addon_cls = load_module(unet_addon_config)
-    unet_addon = unet_addon_cls.from_pretrained(
-            unet_addon_path, torch_dtype=torch.float16)
-    with open("unet_addon_structure.txt", "w") as f:
-        print(unet_addon, file=f)
+def get_vae():
+    vae_path = "pretrained/stable-diffusion-v1-5/vae"
+    from diffusers.models import AutoencoderKL
+    vae = AutoencoderKL.from_pretrained(vae_path)
+    with open("vae_structure.txt", "w") as f:
+        print(vae, file=f)
 
 def get_controlnet():
     controlnet_path = "magicdrive-log/SDv1.5mv-rawbox_2023-09-07_18-39_224x400/controlnet"
@@ -141,23 +138,6 @@ def get_train_config(cfg: DictConfig):
         print('Attached, continue...')
     OmegaConf.save(config=cfg, f="check.yaml", resolve=True)
 
-def add_conv_to_pretrained_unet():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float16
-
-    unet = UNet2DConditionModelMultiview.from_pretrained("magicdrive-log/SDv1.5mv-rawbox_2023-09-07_18-39_224x400/unet")
-    unet.use_virtual_image_encoder = True  # Enable virtual image encoder
-    unet.resnet = ResNet34Half().to(device, dtype=dtype)
-    unet.hidden_image_conv = HiddenImageConv().to(device, dtype=dtype)
-    unet.hidden_image_conv_post = HiddenImageConvPost().to(device, dtype=dtype)
-    unet.virtual_image_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-    ])
-    save_dir = "magicdrive-log/SDv1.5mv-rawbox_2023-09-07_18-39_224x400/unet_addon"
-    os.makedirs(save_dir, exist_ok=True)
-    torch.save(unet.state_dict(), os.path.join(save_dir, "unet_addon_full.pth"))
-    print(f"✅ 成功保存至 {save_dir}/unet_addon_full.pth")
 
 def get_train_config1():
     base_config = OmegaConf.load("configs/tools_train_config.yaml")
@@ -199,5 +179,26 @@ def check_val_dataset():
     print(val_dataset[0]['img'].data.shape)  # torch.Size([6, 3, 224, 400])
     print(val_dataset[0]['gt_bboxes_3d'])
 
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
+def save_dataset(cfg: DictConfig):
+    val_dataset = build_dataset(
+        OmegaConf.to_container(cfg.dataset.data.val, resolve=True)
+    )
+    
+    print(type(val_dataset))
+    
+
+
+def check_train_dataset():
+    train_info = torch.load("train_data_infos.pt")
+    print(type(train_info))
+    print(len(train_info))
+
+def check_val_dataset():
+    val_info = torch.load("val_data_infos.pt")
+    print(type(val_info))
+    print(len(val_info))
+    print(val_info[0])
+
 if __name__ == "__main__":
-    main()
+    save_dataset()
